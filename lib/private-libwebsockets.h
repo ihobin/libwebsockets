@@ -1364,6 +1364,8 @@ struct _lws_http_mode_related {
 	lws_filepos_t content_remain;
 };
 
+#define LWS_HTTP2_FRAME_HEADER_LENGTH 9
+
 #ifdef LWS_WITH_HTTP2
 
 enum lws_http2_settings {
@@ -1402,7 +1404,6 @@ enum lws_http2_flags {
 };
 
 #define LWS_HTTP2_STREAM_ID_MASTER 0
-#define LWS_HTTP2_FRAME_HEADER_LENGTH 9
 #define LWS_HTTP2_SETTINGS_LENGTH 6
 
 struct http2_settings {
@@ -1430,28 +1431,87 @@ enum http2_hpack_state {
 	HKPS_OPT_DISCARD_PADDING,
 };
 
+/*
+ * lws general parsimonious header strategy is only store values from known
+ * headers, and refer to them by index.
+ *
+ * That means if we can't map the peer header name to one that lws knows, we
+ * will drop the content but track the indexing with associated_lws_hdr_idx =
+ * LWS_HPACK_IGNORE_ENTRY.
+ */
+
 enum http2_hpack_type {
-	HPKT_INDEXED_HDR_7,
-	HPKT_INDEXED_HDR_6_VALUE_INCR,
-	HPKT_LITERAL_HDR_VALUE_INCR,
-	HPKT_INDEXED_HDR_4_VALUE,
-	HPKT_LITERAL_HDR_VALUE,
+	HPKT_INDEXED_HDR_7,		/* 1xxxxxxx: just "header field" */
+	HPKT_INDEXED_HDR_6_VALUE_INCR,  /* 01xxxxxx: NEW indexed hdr with value */
+	HPKT_LITERAL_HDR_VALUE_INCR,	/* 01000000: NEW literal hdr with value */
+	HPKT_INDEXED_HDR_4_VALUE,	/* 0000xxxx: indexed hdr with value */
+	HPKT_INDEXED_HDR_4_VALUE_NEVER,	/* 0001xxxx: indexed hdr with value NEVER NEW */
+	HPKT_LITERAL_HDR_VALUE,		/* 00000000: literal hdr with value */
+	HPKT_LITERAL_HDR_VALUE_NEVER,	/* 00010000: literal hdr with value NEVER NEW */
 	HPKT_SIZE_5
 };
 
+#define LWS_HPACK_IGNORE_ENTRY 0xffff
+
 struct hpack_dt_entry {
-	int token; /* additions that don't map to a token are ignored */
-	int arg_offset;
-	int arg_len;
+	char *value; /* malloc'd */
+	uint16_t value_len;
+	uint16_t lws_hdr_idx; /* LWS_HPACK_IGNORE_ENTRY = IGNORE */
 };
 
 struct hpack_dynamic_table {
-	struct hpack_dt_entry *entries;
-	char *args;
+	struct hpack_dt_entry *entries; /* malloc'd */
 	int pos;
-	int next;
+	int used_entries;
 	int num_entries;
-	int args_length;
+};
+
+/*
+ * http/2 connection info that is only used by the root connection that has
+ * the network connection.
+ *
+ * h2 tends to spawn many child connections from one network connection, so
+ * it's necessary to make members only needed by the network connection
+ * distinct and only malloc'd on network connections.
+ *
+ * There's only one HPACK parser per network connection.
+ *
+ * But there is an ah per logical child connection... the network connection
+ * fills it but it belongs to the logical child.
+ */
+struct lws_http2_netconn {
+	struct http2_settings my_settings;
+	struct http2_settings peer_settings;
+	struct hpack_dynamic_table hpack_dyn_table;
+	unsigned char ping_payload[8];
+	unsigned char one_setting[LWS_HTTP2_SETTINGS_LENGTH];
+	char goaway_error_string[32];
+	struct lws *stream_wsi;
+	char *rx_scratch;
+
+	uint32_t  goaway_last_sid;
+	uint32_t  goaway_error_code;
+	unsigned short hpack_pos;
+	unsigned char hpack_m;
+	enum http2_hpack_state hpack;
+	enum http2_hpack_type hpack_type;
+
+	unsigned int huff:1;
+	unsigned int value:1;
+	unsigned int unknown_header:1;
+
+	unsigned int header_index;
+	unsigned int hpack_len;
+	unsigned int hpack_e_dep;
+	unsigned int count;
+	unsigned int length;
+	unsigned int stream_id;
+	unsigned int inside;
+
+	unsigned char frame_state;
+	unsigned char type;
+	unsigned char flags;
+	unsigned char padding;
 };
 
 struct _lws_http2_related {
@@ -1462,25 +1522,12 @@ struct _lws_http2_related {
 	 */
 	struct _lws_http_mode_related http; /* MUST BE FIRST IN STRUCT */
 
-	struct http2_settings my_settings;
-	struct http2_settings peer_settings;
+	struct lws_http2_netconn *h2n; /* malloc'd for root net conn */
 
 	struct lws *parent_wsi;
-	struct lws *next_child_wsi;
+	struct lws *child_list;
+	struct lws *sibling_list;
 
-	struct hpack_dynamic_table *hpack_dyn_table;
-	struct lws *stream_wsi;
-	unsigned char ping_payload[8];
-	unsigned char one_setting[LWS_HTTP2_SETTINGS_LENGTH];
-
-	unsigned int count;
-	unsigned int length;
-	unsigned int stream_id;
-	enum http2_hpack_state hpack;
-	enum http2_hpack_type hpack_type;
-	unsigned int header_index;
-	unsigned int hpack_len;
-	unsigned int hpack_e_dep;
 	int tx_credit;
 	unsigned int my_stream_id;
 	unsigned int child_count;
@@ -1492,18 +1539,10 @@ struct _lws_http2_related {
 	unsigned int GOING_AWAY;
 	unsigned int requested_POLLOUT:1;
 	unsigned int waiting_tx_credit:1;
-	unsigned int huff:1;
-	unsigned int value:1;
 
 	unsigned short round_robin_POLLOUT;
 	unsigned short count_POLLOUT_children;
-	unsigned short hpack_pos;
 
-	unsigned char type;
-	unsigned char flags;
-	unsigned char frame_state;
-	unsigned char padding;
-	unsigned char hpack_m;
 	unsigned char initialized;
 };
 
@@ -1714,6 +1753,7 @@ struct lws {
 
 	unsigned int hdr_parsing_completed:1;
 	unsigned int http2_substream:1;
+	unsigned int upgraded_to_http2:1;
 	unsigned int listener:1;
 	unsigned int user_space_externally_allocated:1;
 	unsigned int socket_is_permanently_unusable:1;
@@ -1955,8 +1995,7 @@ lws_http2_interpret_settings_payload(struct http2_settings *settings,
 LWS_EXTERN void lws_http2_init(struct http2_settings *settings);
 LWS_EXTERN int
 lws_http2_parser(struct lws *wsi, unsigned char c);
-LWS_EXTERN int lws_http2_do_pps_send(struct lws_context *context,
-				     struct lws *wsi);
+LWS_EXTERN int lws_http2_do_pps_send(struct lws *wsi);
 LWS_EXTERN int lws_http2_frame_write(struct lws *wsi, int type, int flags,
 				     unsigned int sid, unsigned int len,
 				     unsigned char *buf);
@@ -1979,7 +2018,11 @@ lws_add_http2_header_status(struct lws *wsi,
 			    unsigned int code, unsigned char **p,
 			    unsigned char *end);
 LWS_EXTERN
-void lws_http2_configure_if_upgraded(struct lws *wsi);
+int lws_http2_configure_if_upgraded(struct lws *wsi);
+void
+lws_hpack_destroy_dynamic_header(struct lws *wsi);
+int
+lws_hpack_dynamic_size(struct lws *wsi, int size);
 #else
 #define lws_http2_configure_if_upgraded(x)
 #endif

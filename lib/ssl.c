@@ -903,9 +903,10 @@ accepted:
 			wsi->mode = LWSCM_RAW;
 		else
 			wsi->mode = LWSCM_HTTP_SERVING;
-
-		lws_http2_configure_if_upgraded(wsi);
-
+#if defined(LWS_WITH_HTTP2)
+		if (lws_http2_configure_if_upgraded(wsi))
+			goto fail;
+#endif
 		lwsl_debug("accepted new SSL conn\n");
 		break;
 	}

@@ -881,7 +881,7 @@ lws_http_action(struct lws *wsi)
 		goto bail_nuke_ah;
 	}
 
-	lwsl_info("Method: %s request for '%s'\n", method_names[meth], uri_ptr);
+	lwsl_info("Method: '%s', request for '%s'\n", method_names[meth], uri_ptr);
 
 	if (lws_ensure_user_space(wsi))
 		goto bail_nuke_ah;
@@ -1588,13 +1588,21 @@ upgrade_h2c:
 		/* http2 union member has http union struct at start */
 		wsi->u.http.ah = ah;
 
-		lws_http2_init(&wsi->u.http2.peer_settings);
-		lws_http2_init(&wsi->u.http2.my_settings);
+		if (!wsi->u.http2.h2n) {
+			wsi->u.http2.h2n = lws_zalloc(sizeof(*wsi->u.http2.h2n));
+			if (!wsi->u.http2.h2n)
+				return 1;
+		}
+
+		lws_http2_init(&wsi->u.http2.h2n->peer_settings);
+		lws_http2_init(&wsi->u.http2.h2n->my_settings);
 
 		/* HTTP2 union */
 
-		lws_http2_interpret_settings_payload(&wsi->u.http2.peer_settings,
+		lws_http2_interpret_settings_payload(&wsi->u.http2.h2n->peer_settings,
 				(unsigned char *)protocol_list, n);
+
+		lws_hpack_dynamic_size(wsi, wsi->u.http2.h2n->my_settings.setting[LWS_HTTP2_SETTINGS__HEADER_TABLE_SIZE]);
 
 		strcpy(protocol_list,
 		       "HTTP/1.1 101 Switching Protocols\x0d\x0a"
@@ -2073,7 +2081,7 @@ lws_create_new_server_wsi(struct lws_vhost *vhost)
 
 	/*
 	 * these can only be set once the protocol is known
-	 * we set an unestablished connection's protocol pointer
+	 * we set an un-established connection's protocol pointer
 	 * to the start of the supported list, so it can look
 	 * for matching ones during the handshake
 	 */
@@ -2109,7 +2117,8 @@ lws_http_transaction_completed(struct lws *wsi)
 
 	lwsl_debug("%s: wsi %p\n", __func__, wsi);
 	/* if we can't go back to accept new headers, drop the connection */
-	if (wsi->u.http.connection_type != HTTP_CONNECTION_KEEP_ALIVE) {
+	if (!wsi->http2_substream &&
+	    wsi->u.http.connection_type != HTTP_CONNECTION_KEEP_ALIVE) {
 		lwsl_info("%s: %p: close connection\n", __func__, wsi);
 		return 1;
 	}

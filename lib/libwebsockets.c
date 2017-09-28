@@ -106,6 +106,15 @@ lws_free_wsi(struct lws *wsi)
 	wsi->peer = NULL;
 #endif
 
+#if defined(LWS_WITH_HTTP2)
+	if (wsi->upgraded_to_http2 || wsi->http2_substream) {
+		lws_hpack_destroy_dynamic_header(wsi);
+
+		if (wsi->u.http2.h2n)
+			lws_free_set_NULL(wsi->u.http2.h2n);
+	}
+#endif
+
 	lws_pt_unlock(pt);
 
 	/* since we will destroy the wsi, make absolutely sure now */
@@ -336,6 +345,59 @@ lws_close_free_wsi(struct lws *wsi, enum lws_close_status reason)
 		}
 		wsi->child_list = NULL;
 	}
+
+#if defined(LWS_WITH_HTTP2)
+
+	if (wsi->u.http2.parent_wsi) {
+		lwsl_info(" wsi: %p, his parent %p: siblings:\n", wsi, wsi->u.http2.parent_wsi->u.http2.child_list);
+		lws_start_foreach_llp(struct lws **, w, wsi->u.http2.parent_wsi->u.http2.child_list) {
+			lwsl_info("   \\---- child %p\n", *w);
+		} lws_end_foreach_llp(w, u.http2.sibling_list);
+	}
+
+	if (wsi->upgraded_to_http2 || wsi->http2_substream) {
+		lwsl_info("closing %p: parent %p\n", wsi, wsi->u.http2.parent_wsi);
+
+		if (wsi->u.http2.child_list) {
+			lwsl_info(" parent %p: closing children: list:\n", wsi);
+			lws_start_foreach_llp(struct lws **, w, wsi->u.http2.child_list) {
+				lwsl_info("   \\---- child %p\n", *w);
+			} lws_end_foreach_llp(w, sibling_list);
+			/* trigger closing of all of our http2 children first */
+			lws_start_foreach_llp(struct lws **, w, wsi->u.http2.child_list) {
+				lwsl_info("   closing child %p\n", *w);
+				/* disconnect from siblings */
+				wsi2 = (*w)->u.http2.sibling_list;
+				(*w)->u.http2.sibling_list = NULL;
+				lws_close_free_wsi(*w, reason);
+				*w = wsi2;
+				continue;
+			} lws_end_foreach_llp(w, u.http2.sibling_list);
+		}
+	}
+
+	if (wsi->http2_substream && wsi->u.http2.parent_wsi) {
+		lwsl_info("  %p: disentangling from siblings\n", wsi);
+		lws_start_foreach_llp(struct lws **, w,
+				wsi->u.http2.parent_wsi->u.http2.child_list) {
+			/* disconnect from siblings */
+			if (*w == wsi) {
+				wsi2 = (*w)->u.http2.sibling_list;
+				(*w)->u.http2.sibling_list = NULL;
+				*w = wsi2;
+				lwsl_info("  %p disentangled from sibling %p\n", wsi, wsi2);
+				break;
+			}
+		} lws_end_foreach_llp(w, u.http2.sibling_list);
+		wsi->u.http2.parent_wsi->u.http2.child_count--;
+		wsi->u.http2.parent_wsi = NULL;
+	}
+
+	if (wsi->upgraded_to_http2) {
+		if (wsi->u.http2.h2n && wsi->u.http2.h2n->rx_scratch)
+			lws_free_set_NULL(wsi->u.http2.h2n->rx_scratch);
+	}
+#endif
 
 	if (wsi->mode == LWSCM_RAW_FILEDESC) {
 			lws_remove_child_from_any_parent(wsi);
@@ -588,7 +650,7 @@ just_kill_connection:
 		} else
 #endif
 		{
-			lwsl_info("%s: shuttdown conn: %p (sock %d, state %d)\n",
+			lwsl_info("%s: shutdown conn: %p (sock %d, state %d)\n",
 				  __func__, wsi, (int)(long)wsi->desc.sockfd,
 				  wsi->state);
 			n = shutdown(wsi->desc.sockfd, SHUT_WR);
@@ -929,6 +991,11 @@ lws_get_peer_simple(struct lws *wsi, char *name, int namelen)
 	struct sockaddr_in sin4;
 	int af = AF_INET;
 	void *p, *q;
+
+#if defined(LWS_WITH_HTTP2)
+	if (wsi->http2_substream)
+		wsi = wsi->u.http2.parent_wsi;
+#endif
 
 	if (wsi->parent_carries_io)
 		wsi = wsi->parent;

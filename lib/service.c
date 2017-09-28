@@ -120,7 +120,7 @@ lws_handle_POLLOUT_event(struct lws *wsi, struct lws_pollfd *pollfd)
 		switch (wsi->pps) {
 		case LWS_PPS_HTTP2_MY_SETTINGS:
 		case LWS_PPS_HTTP2_ACK_SETTINGS:
-			lws_http2_do_pps_send(lws_get_context(wsi), wsi);
+			lws_http2_do_pps_send(wsi);
 			break;
 		default:
 			break;
@@ -395,13 +395,38 @@ user_service_go_again:
 
 	wsi2 = wsi;
 	do {
-		wsi2 = wsi2->u.http2.next_child_wsi;
-		lwsl_info("%s: child %p\n", __func__, wsi2);
+		wsi2 = wsi2->u.http2.child_list;
 		if (!wsi2)
 			continue;
 		if (!wsi2->u.http2.requested_POLLOUT)
 			continue;
 		wsi2->u.http2.requested_POLLOUT = 0;
+
+		lwsl_info("%s: child %p (state %d)\n", __func__, wsi2, wsi2->state);
+
+		if (wsi2->state == LWSS_HTTP_ISSUING_FILE) {
+
+			wsi2->leave_pollout_active = 0;
+
+			/* >0 == completion, <0 == error
+			 *
+			 * We'll get a LWS_CALLBACK_HTTP_FILE_COMPLETION callback when
+			 * it's done.  That's the case even if we just completed the
+			 * send, so wait for that.
+			 */
+			n = lws_serve_http_file_fragment(wsi2);
+			lwsl_debug("lws_serve_http_file_fragment says %d\n", n);
+
+			if (n == 0)
+				return 1;
+			if (n < 0) {
+				lwsl_debug("Closing POLLOUT child %p\n", wsi2);
+				lws_close_free_wsi(wsi2, LWS_CLOSE_STATUS_NOSTATUS);
+			}
+
+			continue;
+		}
+
 		if (lws_calllback_as_writeable(wsi2)) {
 			lwsl_debug("Closing POLLOUT child\n");
 			lws_close_free_wsi(wsi2, LWS_CLOSE_STATUS_NOSTATUS);
@@ -1258,15 +1283,29 @@ read:
 				 * as to what it can output...) has to go in per-wsi rx buf area.
 				 * Otherwise in large temp serv_buf area.
 				 */
-				eff_buf.token = (char *)pt->serv_buf;
-				if (lws_is_ws_with_ext(wsi)) {
-					eff_buf.token_len = wsi->u.ws.rx_ubuf_alloc;
-				} else {
-					eff_buf.token_len = context->pt_serv_buf_size;
-				}
 
-				if ((unsigned int)eff_buf.token_len > context->pt_serv_buf_size)
-					eff_buf.token_len = context->pt_serv_buf_size;
+#if defined(LWS_WITH_HTTP2)
+				if (wsi->upgraded_to_http2) {
+					if (!wsi->u.http2.h2n->rx_scratch) {
+						wsi->u.http2.h2n->rx_scratch = lws_malloc(512);
+						if (!wsi->u.http2.h2n->rx_scratch)
+							goto close_and_handled;
+					}
+					eff_buf.token = wsi->u.http2.h2n->rx_scratch;
+					eff_buf.token_len = sizeof(wsi->u.http2.h2n->rx_scratch);
+				} else
+#endif
+				{
+					eff_buf.token = (char *)pt->serv_buf;
+					if (lws_is_ws_with_ext(wsi)) {
+						eff_buf.token_len = wsi->u.ws.rx_ubuf_alloc;
+					} else {
+						eff_buf.token_len = context->pt_serv_buf_size;
+					}
+
+					if ((unsigned int)eff_buf.token_len > context->pt_serv_buf_size)
+						eff_buf.token_len = context->pt_serv_buf_size;
+				}
 
 				eff_buf.token_len = lws_ssl_capable_read(wsi,
 					(unsigned char *)eff_buf.token, pending ? pending :
@@ -1352,7 +1391,6 @@ drain:
 				 * around again it will pick up from where it
 				 * left off.
 				 */
-
 				n = lws_read(wsi, (unsigned char *)eff_buf.token,
 					     eff_buf.token_len);
 				if (n < 0) {
@@ -1367,8 +1405,7 @@ drain:
 		} while (more);
 
 		if (wsi->u.hdr.ah) {
-			lwsl_notice("%s: %p: detaching\n",
-				 __func__, wsi);
+			lwsl_debug("%s: %p: detaching\n", __func__, wsi);
 			lws_header_table_force_to_detachable_state(wsi);
 			/* we can run the normal ah detach flow despite
 			 * being in ws union mode, since all union members

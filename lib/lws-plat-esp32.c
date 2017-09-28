@@ -1498,7 +1498,7 @@ lws_esp32_wlan_start_station(void)
 
 	tcpip_adapter_set_hostname(TCPIP_ADAPTER_IF_STA, (const char *)&config.ap.ssid[7]);
 	esp_wifi_set_auto_connect(1);
-	ESP_ERROR_CHECK( esp_wifi_connect());
+	//ESP_ERROR_CHECK( esp_wifi_connect());
 
 	lws_esp32_scan_timer_cb(NULL);
 }
